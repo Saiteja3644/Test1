@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+import pandas as pd, numpy as np, matplotlib.pyplot as plt, os, argparse
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as RLImage, Table, TableStyle
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.units import inch
+from reportlab.lib import colors
+try:
+    import statsmodels.formula.api as smf
+    HAS_SM=True
+except Exception:
+    HAS_SM=False
+
+def fit_quad(xv, yv):
+    import numpy as np
+    X = np.column_stack([xv, xv**2, np.ones_like(xv)])
+    beta, *_ = np.linalg.lstsq(X, yv, rcond=None)
+    yhat = X @ beta
+    rss = np.sum((yv - yhat)**2); n=len(yv); k=len(beta)
+    aic = n*np.log(rss/n + 1e-12) + 2*k
+    return beta, aic
+
+def main(csv, time_col, revenue_col):
+    df = pd.read_csv(csv)
+    controls = [c for c in df.columns if c not in [time_col, revenue_col]]
+    work_df = df[[time_col, revenue_col] + controls].replace([np.inf, -np.inf], np.nan).dropna(subset=[time_col, revenue_col])
+    x = work_df[time_col].astype(float).values.reshape(-1,1)
+    y = work_df[revenue_col].astype(float).values
+    import numpy as np
+    A = np.vstack([x.flatten(), np.ones(len(x))]).T
+    m, b = np.linalg.lstsq(A, y, rcond=None)[0]
+    plt.figure(); plt.scatter(x,y,s=15)
+    xs = np.linspace(x.min(), x.max(), 120); ys = m*xs + b; plt.plot(xs,ys)
+    plt.xlabel(time_col); plt.ylabel(revenue_col); plt.title('Time on Page vs Revenue with Best-Fit Line')
+    plt.savefig('scatter_time_vs_revenue.png', bbox_inches='tight', dpi=180); plt.close()
+    plt.figure(); res = y - (m*x.flatten()+b); plt.scatter(x,res,s=15); plt.axhline(0)
+    plt.xlabel(time_col); plt.ylabel('Residuals'); plt.title('Residual Plot')
+    plt.savefig('residuals.png', bbox_inches='tight', dpi=180); plt.close()
+    beta_q, aic_q = fit_quad(x.flatten(), y)
+    rss_lin = np.sum((y - (m*x.flatten()+b))**2); n=len(y); aic_lin = n*np.log(rss_lin/n + 1e-12) + 2*2
+    quad_path=None
+    if aic_q < aic_lin:
+        xs2 = np.linspace(x.min(), x.max(), 220)
+        Xs = np.column_stack([xs2, xs2**2, np.ones_like(xs2)]); yh = Xs @ beta_q
+        plt.figure(); plt.scatter(x,y,s=15); plt.plot(xs2,yh)
+        plt.xlabel(time_col); plt.ylabel(revenue_col); plt.title('Quadratic Fit: Time on Page vs Revenue')
+        quad_path = 'quadratic_fit.png'; plt.savefig(quad_path, bbox_inches='tight', dpi=180); plt.close()
+    corr = float(np.corrcoef(work_df[time_col].astype(float), work_df[revenue_col].astype(float))[0,1])
+    p_time=None; ci=None
+    if HAS_SM:
+        X_ctrl = work_df[[time_col]].copy()
+        for c in controls:
+            if work_df[c].dtype.kind in 'biufc': X_ctrl[c]=work_df[c].astype(float)
+            else: X_ctrl = pd.concat([X_ctrl, pd.get_dummies(work_df[c].astype(str), prefix=c, drop_first=True)], axis=1)
+        reg_df = pd.concat([X_ctrl, work_df[revenue_col].astype(float)], axis=1).copy()
+        safe_cols = {c: c.replace(' ','_').replace('(','').replace(')','').replace('-','_') for c in reg_df.columns}
+        reg_df = reg_df.rename(columns=safe_cols)
+        time_safe = safe_cols[time_col]; y_safe=safe_cols[revenue_col]
+        rhs = [time_safe] + [c for c in reg_df.columns if c not in [time_safe, y_safe]]
+        formula = f"{y_safe} ~ " + " + ".join(rhs)
+        multi_model = smf.ols(formula, data=reg_df).fit()
+        uni_model = smf.ols('revenue_col ~ time_col', data=work_df[[time_col, revenue_col]].rename(columns={time_col:'time_col', revenue_col:'revenue_col'})).fit()
+        uni_coef = float(uni_model.params.get('time_col', np.nan)); uni_r2 = float(uni_model.rsquared)
+        r2_multi = float(multi_model.rsquared); p_time = float(multi_model.pvalues.get(time_safe, np.nan))
+        try: ci_vals = multi_model.conf_int().loc[time_safe].tolist(); ci=[float(ci_vals[0]), float(ci_vals[1])]
+        except Exception: pass
+    else:
+        from sklearn.linear_model import LinearRegression
+        lr = LinearRegression().fit(x,y); uni_coef=float(lr.coef_[0])
+        yhat = lr.predict(x); ss_res=np.sum((y-yhat)**2); ss_tot=np.sum((y-np.mean(y))**2); uni_r2=float(1-ss_res/ss_tot)
+        X_ctrl = work_df[[time_col]].copy()
+        for c in controls:
+            if work_df[c].dtype.kind in 'biufc': X_ctrl[c]=work_df[c].astype(float)
+            else: X_ctrl = pd.concat([X_ctrl, pd.get_dummies(work_df[c].astype(str), prefix=c, drop_first=True)], axis=1)
+        lr2 = LinearRegression().fit(X_ctrl.values.astype(float), y)
+        yhat2 = lr2.predict(X_ctrl.values.astype(float))
+        ss_res2 = np.sum((y - yhat2)**2); ss_tot2 = np.sum((y - np.mean(y))**2); r2_multi=float(1-ss_res2/ss_tot2)
+    doc = SimpleDocTemplate('analysis_report.pdf', pagesize=letter, rightMargin=36, leftMargin=36, topMargin=36, bottomMargin=36)
+    styles = getSampleStyleSheet(); flow=[]
+    flow.append(Paragraph('<b>Time on Page & Revenue: Brief Findings</b>', styles['Title'])); flow.append(Spacer(1,8))
+    trend = 'increases' if uni_coef>=0 else 'decreases'
+    summary = f"""<b>Executive Summary</b><br/>We examined how time on page (“{time_col}”) relates to revenue (“{revenue_col}”). Overall correlation is {corr:.3f}. A simple line fit suggests that revenue {{trend}} as time on page increases. When we control for other variables, the model explains R² = {r2_multi:.3f} of revenue variation."""
+    flow.append(Paragraph(summary, styles['BodyText'])); flow.append(Spacer(1,8))
+    tbl=[['Metric','Value'], ['Pearson correlation (time vs revenue)', f'{corr:.3f}'], ['Univariate slope (Δrevenue per Δtime)', f'{uni_coef:.4g}'], ['Univariate R²', f'{uni_r2:.3f}'], ['Multivariate R² (with controls)', f'{r2_multi:.3f}']]
+    if p_time is not None: tbl.append(['Multivariate p-value for time', f'{p_time:.4g}'])
+    if ci is not None: tbl.append(['95% CI for time coefficient', f'[{ci[0]:.4g}, {ci[1]:.4g}]'])
+    t = Table(tbl, hAlign='LEFT', colWidths=[3*inch, 3.5*inch]); t.setStyle(TableStyle([('GRID',(0,0),(-1,-1),0.5,colors.grey), ('BACKGROUND',(0,0),(-1,0),colors.lightgrey), ('FONTNAME',(0,0),(-1,0),'Helvetica-Bold')]))
+    flow.append(t); flow.append(Spacer(1,10))
+    for pth in ['scatter_time_vs_revenue.png','residuals.png','quadratic_fit.png']:
+        if os.path.exists(pth): flow.append(Paragraph(f'<b>{pth}</b>', styles['Heading3'])); flow.append(RLImage(pth, width=6.5*inch, height=3.8*inch)); flow.append(Spacer(1,12))
+    doc.build(flow)
+
+if __name__ == '__main__':
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--csv', default='testdata (1).csv')
+    ap.add_argument('--time', default='top')
+    ap.add_argument('--revenue', default='revenue')
+    args = ap.parse_args()
+    main(args.csv, args.time, args.revenue)
